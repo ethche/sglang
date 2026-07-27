@@ -1,11 +1,126 @@
+from functools import partial
+
+import helion
+import helion.language as hl
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.layers.moe.moe_runner.triton_utils.helion_utils import (
+    get_model_depths,
+    helion_aot_autotune,
+)
 
 DEFAULT_BLOCK_SIZE = 4096
 BLOCK_SIZE_M = 128
+
+
+def silu_and_mul_key(
+    gateup_output: torch.Tensor,
+    topk_weights: torch.Tensor | None,
+    out_dtype: object | None = None,
+):
+    # Keep this stable across inputs for Helion AOT autotune.
+    del out_dtype
+    return gateup_output.shape[1], (gateup_output.dtype,), (topk_weights is not None,)
+
+
+def silu_and_mul_inputs(sizes: list[int]):
+    # Used only for Helion autotune input generation.
+    inputs = []
+    numel = 2**30
+    with torch.device("cuda"):
+        for size in sizes:
+            x = torch.randn(numel // size, 2 * size, dtype=torch.bfloat16)
+            inputs.append((x, None, None))
+            inputs.append((x, torch.randn(numel // size, dtype=torch.bfloat16), None))
+    return inputs
+
+
+@helion_aot_autotune(
+    "silu_and_mul_interleaved",
+    kernel_key=silu_and_mul_key,
+    primary_inputs=partial(silu_and_mul_inputs, sizes=[512, 2048, 48 * 96, 6144, 8192]),
+    secondary_inputs=partial(
+        silu_and_mul_inputs,
+        sizes=[512]
+        + [i * 96 for i in get_model_depths()]
+        + list(range(1024, 8192 + 1, 1024)),
+    ),
+)
+@helion.kernel(static_shapes=False)
+def _silu_and_mul_helion_interleaved_kernel(
+    gateup_output,
+    topk_weights: torch.Tensor | None = None,
+    out_dtype: hl.constexpr | None = None,
+):
+    """
+    Interleaved version of silu_and_mul using Helion kernel.
+    Input format: [gate[0], up[0], gate[1], up[1], ...]
+    This matches the interleaved w13 weight format.
+    """
+    batch_size, hidden_size = gateup_output.shape
+    hidden_size = hl.specialize(hidden_size)
+    assert hidden_size % 2 == 0, f"{hidden_size=}"
+
+    half_hidden_size = hidden_size // 2
+    down_input = gateup_output.new_empty(
+        batch_size, half_hidden_size, dtype=out_dtype or gateup_output.dtype
+    )
+    for batch_tile, hidden_tile in hl.tile([batch_size, half_hidden_size]):
+        gate_output = gateup_output[batch_tile, 2 * hidden_tile.index].to(torch.float32)
+        up_output = gateup_output[batch_tile, 2 * hidden_tile.index + 1].to(
+            torch.float32
+        )
+        silu_mul_output = gate_output * torch.sigmoid(gate_output) * up_output
+        if topk_weights is not None:
+            weight_scale = topk_weights[batch_tile, None].to(torch.float32)
+            silu_mul_output = silu_mul_output * weight_scale
+        down_input[batch_tile, hidden_tile] = silu_mul_output
+    return down_input
+
+
+@helion_aot_autotune(
+    "silu_and_mul",
+    kernel_key=silu_and_mul_key,
+    primary_inputs=partial(silu_and_mul_inputs, sizes=[512, 2048, 48 * 96, 6144, 8192]),
+    secondary_inputs=partial(
+        silu_and_mul_inputs,
+        sizes=[512]
+        + [i * 96 for i in get_model_depths()]
+        + list(range(1024, 8192 + 1, 1024)),
+    ),
+)
+@helion.kernel(static_shapes=False)
+def _silu_and_mul_helion_non_interleaved_kernel(
+    gateup_output,
+    topk_weights: torch.Tensor | None = None,
+    out_dtype: hl.constexpr | None = None,
+):
+    """
+    Non-interleaved version of silu_and_mul using Helion kernel.
+    Input format: [gate[0], gate[1], ..., gate[N-1], up[0], up[1], ..., up[N-1]]
+    """
+    batch_size, hidden_size = gateup_output.shape
+    hidden_size = hl.specialize(hidden_size)
+    assert hidden_size % 2 == 0, f"{hidden_size=}"
+
+    half_hidden_size = hidden_size // 2
+    down_input = gateup_output.new_empty(
+        batch_size, half_hidden_size, dtype=out_dtype or gateup_output.dtype
+    )
+    for batch_tile, hidden_tile in hl.tile([batch_size, half_hidden_size]):
+        gate_output = gateup_output[batch_tile, hidden_tile.index].to(torch.float32)
+        up_output = gateup_output[batch_tile, hidden_tile.index + half_hidden_size].to(
+            torch.float32
+        )
+        silu_mul_output = gate_output * torch.sigmoid(gate_output) * up_output
+        if topk_weights is not None:
+            weight_scale = topk_weights[batch_tile, None].to(torch.float32)
+            silu_mul_output = silu_mul_output * weight_scale
+        down_input[batch_tile, hidden_tile] = silu_mul_output
+    return down_input
 
 
 def silu_and_mul_helion(
@@ -14,14 +129,28 @@ def silu_and_mul_helion(
     out_dtype: torch.dtype | None = None,
     use_interleaved: bool = True,
 ) -> torch.Tensor:
-    from sglang.kernels.ops.moe.inkling_helion import silu_and_mul_helion as helion_impl
+    """
+    Unified silu_and_mul function using Helion kernel.
+    Supports both interleaved and non-interleaved input formats.
 
-    return helion_impl(
-        gateup_output,
-        topk_weights=topk_weights,
-        out_dtype=out_dtype,
-        use_interleaved=use_interleaved,
-    )
+    Args:
+        gateup_output: Input tensor of shape (batch_size, hidden_size)
+        topk_weights: Optional topk weights tensor
+        out_dtype: Optional output dtype
+        use_interleaved: If True, expects interleaved format [gate[0], up[0], gate[1], up[1], ...]
+                        If False, expects non-interleaved format [gate[0], ..., gate[N-1], up[0], ..., up[N-1]]
+
+    Returns:
+        Output tensor of shape (batch_size, hidden_size // 2)
+    """
+    if use_interleaved:
+        return _silu_and_mul_helion_interleaved_kernel(
+            gateup_output, topk_weights, out_dtype
+        )
+    else:
+        return _silu_and_mul_helion_non_interleaved_kernel(
+            gateup_output, topk_weights, out_dtype
+        )
 
 
 # ---------------------------------------------------------------------------
