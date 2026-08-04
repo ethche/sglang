@@ -7994,10 +7994,13 @@ class ServerArgs:
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
         #   stride as a free int64 — natively strided); cutedsl and helion on
         #   KDA-hybrid models only. cutedsl_gdn still compiles h0 against a
-        #   contiguous dummy, while Helion specializes the runtime strides.
+        #   contiguous dummy. Helion specializes state strides 0-3, compiling
+        #   one variant per stride tuple, and rejects a non-unit innermost
+        #   decode stride.
         # - prefill: triton; flashkda (wrapper gathers/scatters a contiguous
         #   per-slot copy, external kernel never sees the pool); cutedsl and
-        #   helion on KDA-hybrid models only, with dynamic/specialized strides.
+        #   helion on KDA-hybrid models only; Helion specializes all four state
+        #   strides, compiling one variant per stride tuple.
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
         # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
