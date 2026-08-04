@@ -7992,13 +7992,12 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64 — natively strided); cutedsl (KDA fused
-        #   sigmoid-gating update made stride-safe) on KDA-hybrid models only —
-        #   cutedsl_gdn still compiles h0 against a contiguous dummy.
+        #   stride as a free int64 — natively strided); cutedsl and helion on
+        #   KDA-hybrid models only. cutedsl_gdn still compiles h0 against a
+        #   contiguous dummy, while Helion specializes the runtime strides.
         # - prefill: triton; flashkda (wrapper gathers/scatters a contiguous
-        #   per-slot copy, external kernel never sees the pool); cutedsl
-        #   (kernel_h compiles h0/ht with dynamic int64 strides), same
-        #   KDA-only caveat.
+        #   per-slot copy, external kernel never sees the pool); cutedsl and
+        #   helion on KDA-hybrid models only, with dynamic/specialized strides.
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
         # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
@@ -8006,7 +8005,9 @@ class ServerArgs:
         prefill_allowed = {"triton", "flashkda"}
         if self.use_mla_backend():
             decode_allowed.add("cutedsl")
+            decode_allowed.add("helion")
             prefill_allowed.add("cutedsl")
+            prefill_allowed.add("helion")
         resolved_linear_decode = (
             self.linear_attn_decode_backend or self.linear_attn_backend
         )
